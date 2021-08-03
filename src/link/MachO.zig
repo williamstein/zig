@@ -67,6 +67,10 @@ archives: std.ArrayListUnmanaged(Archive) = .{},
 dylibs: std.ArrayListUnmanaged(Dylib) = .{},
 referenced_dylibs: std.AutoArrayHashMapUnmanaged(u16, void) = .{},
 
+/// TODO add a quick lookup by name so that we don't dupe search dirs
+/// in the incremental context.
+lib_dirs: std.ArrayListUnmanaged([]const u8) = .{},
+
 load_commands: std.ArrayListUnmanaged(LoadCommand) = .{},
 
 pagezero_segment_cmd_index: ?u16 = null,
@@ -86,9 +90,6 @@ version_min_cmd_index: ?u16 = null,
 source_version_cmd_index: ?u16 = null,
 uuid_cmd_index: ?u16 = null,
 code_signature_cmd_index: ?u16 = null,
-/// Path to libSystem
-/// TODO this is obsolete, remove it.
-libsystem_cmd_index: ?u16 = null,
 
 // __TEXT segment sections
 text_section_index: ?u16 = null,
@@ -267,34 +268,12 @@ pub const GotIndirectionKey = struct {
     where_index: u32,
 };
 
-pub const PIEFixup = struct {
-    /// Target VM address of this relocation.
-    target_addr: u64,
-
-    /// Offset within the byte stream.
-    offset: usize,
-
-    /// Size of the relocation.
-    size: usize,
-};
-
 /// When allocating, the ideal_capacity is calculated by
 /// actual_capacity + (actual_capacity / ideal_factor)
 const ideal_factor = 2;
 
 /// Default path to dyld
-/// TODO instead of hardcoding it, we should probably look through some env vars and search paths
-/// instead but this will do for now.
-const DEFAULT_DYLD_PATH: [*:0]const u8 = "/usr/lib/dyld";
-
-/// Default lib search path
-/// TODO instead of hardcoding it, we should probably look through some env vars and search paths
-/// instead but this will do for now.
-const DEFAULT_LIB_SEARCH_PATH: []const u8 = "/usr/lib";
-
-const LIB_SYSTEM_NAME: [*:0]const u8 = "System";
-/// TODO we should search for libSystem and fail if it doesn't exist, instead of hardcoding it
-const LIB_SYSTEM_PATH: [*:0]const u8 = DEFAULT_LIB_SEARCH_PATH ++ "/libSystem.B.dylib";
+const DYLD_PATH: [*:0]const u8 = "/usr/lib/dyld";
 
 /// In order for a slice of bytes to be considered eligible to keep metadata pointing at
 /// it as a possible place to put new symbols, it must have enough room for this many bytes
@@ -356,30 +335,32 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
         return self;
     }
 
-    if (!options.strip and options.module != null) {
-        // Create dSYM bundle.
-        const dir = options.module.?.zig_cache_artifact_directory;
-        log.debug("creating {s}.dSYM bundle in {s}", .{ sub_path, dir.path });
+    if (options.module) |module| {
+        if (!options.strip) {
+            // Create dSYM bundle.
+            const dir = module.zig_cache_artifact_directory;
+            log.debug("creating {s}.dSYM bundle in {s}", .{ sub_path, dir.path });
 
-        const d_sym_path = try fmt.allocPrint(
-            allocator,
-            "{s}.dSYM" ++ fs.path.sep_str ++ "Contents" ++ fs.path.sep_str ++ "Resources" ++ fs.path.sep_str ++ "DWARF",
-            .{sub_path},
-        );
-        defer allocator.free(d_sym_path);
+            const d_sym_path = try fmt.allocPrint(
+                allocator,
+                "{s}.dSYM" ++ fs.path.sep_str ++ "Contents" ++ fs.path.sep_str ++ "Resources" ++ fs.path.sep_str ++ "DWARF",
+                .{sub_path},
+            );
+            defer allocator.free(d_sym_path);
 
-        var d_sym_bundle = try dir.handle.makeOpenPath(d_sym_path, .{});
-        defer d_sym_bundle.close();
+            var d_sym_bundle = try dir.handle.makeOpenPath(d_sym_path, .{});
+            defer d_sym_bundle.close();
 
-        const d_sym_file = try d_sym_bundle.createFile(sub_path, .{
-            .truncate = false,
-            .read = true,
-        });
+            const d_sym_file = try d_sym_bundle.createFile(sub_path, .{
+                .truncate = false,
+                .read = true,
+            });
 
-        self.d_sym = .{
-            .base = self,
-            .file = d_sym_file,
-        };
+            self.d_sym = .{
+                .base = self,
+                .file = d_sym_file,
+            };
+        }
     }
 
     // Index 0 is always a null symbol.
@@ -431,58 +412,88 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
     const use_stage1 = build_options.is_stage1 and self.base.options.use_stage1;
     if (use_stage1) {
         return self.linkWithZld(comp);
-    } else {
-        switch (self.base.options.effectiveOutputMode()) {
-            .Exe, .Obj => {},
-            .Lib => return error.TODOImplementWritingLibFiles,
-        }
-        return self.flushModule(comp);
     }
+
+    switch (self.base.options.effectiveOutputMode()) {
+        .Exe => {},
+        .Obj => return error.TODOImplementWritingObjFiles,
+        .Lib => return error.TODOImplementWritingLibFiles,
+    }
+
+    return self.flushModule(comp);
 }
 
 pub fn flushModule(self: *MachO, comp: *Compilation) !void {
-    _ = comp;
     const tracy = trace(@src());
     defer tracy.end();
 
     const output_mode = self.base.options.output_mode;
     const target = self.base.options.target;
 
-    switch (output_mode) {
-        .Exe => {
-            if (self.entry_addr) |addr| {
-                // Update LC_MAIN with entry offset.
-                const text_segment = self.load_commands.items[self.text_segment_cmd_index.?].Segment;
-                const main_cmd = &self.load_commands.items[self.main_cmd_index.?].Main;
-                main_cmd.entryoff = addr - text_segment.inner.vmaddr;
-                main_cmd.stacksize = self.base.options.stack_size_override orelse 0;
-                self.load_commands_dirty = true;
-            }
-            try self.writeRebaseInfoTable();
-            try self.writeBindInfoTable();
-            try self.writeLazyBindInfoTable();
-            try self.writeExportInfo();
-            try self.writeAllGlobalAndUndefSymbols();
-            try self.writeIndirectSymbolTable();
-            try self.writeStringTable();
-            try self.updateLinkeditSegmentSizes();
+    // Resolve libSystem upfront.
+    const lib_system = try resolveLibSystem(
+        self.base.allocator,
+        self.lib_dirs.items,
+        self.base.options.is_native_os,
+        comp,
+    );
 
-            if (self.d_sym) |*ds| {
-                // Flush debug symbols bundle.
-                try ds.flushModule(self.base.allocator, self.base.options);
-            }
+    if (!self.strtab_dir.containsAdapted(@as([]const u8, "dyld_stub_binder"), StringSliceAdapter{
+        .strtab = &self.strtab,
+    })) {
+        const import_sym_index = @intCast(u32, self.imports.items.len);
+        const n_strx = try self.makeString("dyld_stub_binder");
+        try self.imports.append(self.base.allocator, .{
+            .n_strx = n_strx,
+            .n_type = macho.N_UNDF | macho.N_EXT,
+            .n_sect = 0,
+            .n_desc = @intCast(u8, 1) * macho.N_SYMBOL_RESOLVER,
+            .n_value = 0,
+        });
+        try self.symbol_resolver.putNoClobber(self.base.allocator, n_strx, .{
+            .where = .import,
+            .where_index = import_sym_index,
+        });
+        const got_key = GotIndirectionKey{
+            .where = .import,
+            .where_index = import_sym_index,
+        };
+        const got_index = @intCast(u32, self.got_entries.items.len);
+        try self.got_entries.append(self.base.allocator, got_key);
+        try self.got_entries_map.putNoClobber(self.base.allocator, got_key, got_index);
+        try self.writeGotEntry(got_index);
+        self.binding_info_dirty = true;
+    }
 
-            if (target.cpu.arch == .aarch64) {
-                // Preallocate space for the code signature.
-                // We need to do this at this stage so that we have the load commands with proper values
-                // written out to the file.
-                // The most important here is to have the correct vm and filesize of the __LINKEDIT segment
-                // where the code signature goes into.
-                try self.writeCodeSignaturePadding();
-            }
-        },
-        .Obj => {},
-        .Lib => return error.TODOImplementWritingLibFiles,
+    if (self.entry_addr) |addr| {
+        // Update LC_MAIN with entry offset.
+        const text_segment = self.load_commands.items[self.text_segment_cmd_index.?].Segment;
+        const main_cmd = &self.load_commands.items[self.main_cmd_index.?].Main;
+        main_cmd.entryoff = addr - text_segment.inner.vmaddr;
+        main_cmd.stacksize = self.base.options.stack_size_override orelse 0;
+        self.load_commands_dirty = true;
+    }
+    try self.writeRebaseInfoTable();
+    try self.writeBindInfoTable();
+    try self.writeLazyBindInfoTable();
+    try self.writeExportInfo();
+    try self.writeAllGlobalAndUndefSymbols();
+    try self.writeIndirectSymbolTable();
+    try self.writeStringTable();
+    try self.updateLinkeditSegmentSizes();
+
+    if (self.d_sym) |*ds| {
+        // Flush debug symbols bundle.
+        try ds.flushModule(self.base.allocator, self.base.options);
+    }
+
+    if (target.cpu.arch == .aarch64) {
+        // Preallocate space for the code signature.
+        // We need to do this at this stage so that we have the load commands with proper values
+        // written out to the file.
+        // The most important here is to have the correct vm and filesize of the __LINKEDIT segment
+        // where the code signature goes into.
+        try self.writeCodeSignaturePadding();
     }
 
     try self.writeLoadCommands();
@@ -514,10 +525,14 @@ pub fn flushModule(self: *MachO, comp: *Compilation) !void {
 }
 
 fn resolveSearchDir(
-    arena: *Allocator,
+    allocator: *Allocator,
     dir: []const u8,
     syslibroot: ?[]const u8,
 ) !?[]const u8 {
+    var arena_allocator = std.heap.ArenaAllocator.init(allocator);
+    defer arena_allocator.deinit();
+    const arena = &arena_allocator.allocator;
+
     var candidates = std.ArrayList([]const u8).init(arena);
 
     if (fs.path.isAbsolute(dir)) {
@@ -537,22 +552,24 @@ fn resolveSearchDir(
         };
         defer tmp.close();
 
-        return candidate;
+        return allocator.dupe(u8, candidate);
     }
 
     return null;
 }
 
 fn resolveLib(
-    arena: *Allocator,
+    allocator: *Allocator,
     search_dirs: []const []const u8,
     name: []const u8,
     ext: []const u8,
 ) !?[]const u8 {
-    const search_name = try std.fmt.allocPrint(arena, "lib{s}{s}", .{ name, ext });
+    const search_name = try std.fmt.allocPrint(allocator, "lib{s}{s}", .{ name, ext });
+    defer allocator.free(search_name);
 
     for (search_dirs) |dir| {
-        const full_path = try fs.path.join(arena, &[_][]const u8{ dir, search_name });
+        const full_path = try fs.path.join(allocator, &[_][]const u8{ dir, search_name });
+        errdefer allocator.free(full_path);
 
         // Check if the file exists.
         const tmp = fs.cwd().openFile(full_path, .{}) catch |err| switch (err) {
@@ -568,16 +585,19 @@ fn resolveLib(
 }
 
 fn resolveFramework(
-    arena: *Allocator,
+    allocator: *Allocator,
     search_dirs: []const []const u8,
     name: []const u8,
     ext: []const u8,
 ) !?[]const u8 {
-    const search_name = try std.fmt.allocPrint(arena, "{s}{s}", .{ name, ext });
-    const prefix_path = try std.fmt.allocPrint(arena, "{s}.framework", .{name});
+    const search_name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ name, ext });
+    defer allocator.free(search_name);
+    const prefix_path = try std.fmt.allocPrint(allocator, "{s}.framework", .{name});
+    defer allocator.free(prefix_path);
 
     for (search_dirs) |dir| {
-        const full_path = try fs.path.join(arena, &[_][]const u8{ dir, prefix_path, search_name });
+        const full_path = try fs.path.join(allocator, &[_][]const u8{ dir, prefix_path, search_name });
+        errdefer allocator.free(full_path);
 
         // Check if the file exists.
         const tmp = fs.cwd().openFile(full_path, .{}) catch |err| switch (err) {
@@ -590,6 +610,48 @@ fn resolveFramework(
     }
 
     return null;
+}
+
+fn resolveLibSystem(
+    allocator: *Allocator,
+    search_dirs: []const []const u8,
+    is_native_os: bool,
+    comp: *Compilation,
+) ![][]const u8 {
+    var resolved = std.ArrayList([]const u8).init(allocator);
+    defer resolved.deinit();
+    try resolved.ensureTotalCapacity(2);
+
+    // If we're compiling native and we can find libSystem.B.{dylib, tbd},
+    // we link against that instead of embedded libSystem.B.tbd file.
+    var found: bool = false;
+    if (is_native_os) blk: {
+        // Try stub file first. If we hit it, then we're done as the stub file
+        // re-exports every single symbol definition.
+        if (try resolveLib(allocator, search_dirs, "System", ".tbd")) |full_path| {
+            resolved.appendAssumeCapacity(full_path);
+            found = true;
+            break :blk;
+        }
+        // If we didn't hit the stub file, try .dylib next. However, libSystem.dylib
+        // doesn't export libc.dylib which we'll need to resolve subsequently also.
+        if (try resolveLib(allocator, search_dirs, "System", ".dylib")) |libsystem_path| {
+            if (try resolveLib(allocator, search_dirs, "c", ".dylib")) |libc_path| {
+                resolved.appendAssumeCapacity(libsystem_path);
+                resolved.appendAssumeCapacity(libc_path);
+                found = true;
+            }
+        }
+    }
+
+    if (!found) {
+        const full_path = try comp.zig_lib_directory.join(allocator, &[_][]const u8{
+            "libc", "darwin", "libSystem.B.tbd",
+        });
+        resolved.appendAssumeCapacity(full_path);
+    }
+
+    return resolved.toOwnedSlice();
 }
 
 fn linkWithZld(self: *MachO, comp: *Compilation) !void {
@@ -761,10 +823,9 @@ fn linkWithZld(self: *MachO, comp: *Compilation) !void {
             try search_lib_names.append(link_lib);
         }
 
-        var lib_dirs = std.ArrayList([]const u8).init(arena);
         for (self.base.options.lib_dirs) |dir| {
-            if (try resolveSearchDir(arena, dir, self.base.options.sysroot)) |search_dir| {
-                try lib_dirs.append(search_dir);
+            if (try resolveSearchDir(self.base.allocator, dir, self.base.options.sysroot)) |search_dir| {
+                try self.lib_dirs.append(self.base.allocator, search_dir);
             } else {
                 log.warn("directory not found for '-L{s}'", .{dir});
             }
@@ -777,7 +838,7 @@ fn linkWithZld(self: *MachO, comp: *Compilation) !void {
             // Look in each directory for a dylib (stub first), and then for archive
             // TODO implement alternative: -search_dylibs_first
             for (&[_][]const u8{ ".tbd", ".dylib", ".a" }) |ext| {
-                if (try resolveLib(arena, lib_dirs.items, lib_name, ext)) |full_path| {
+                if (try resolveLib(arena, self.lib_dirs.items, lib_name, ext)) |full_path| {
                     try libs.append(full_path);
                     break;
                 }
@@ -789,39 +850,19 @@ fn linkWithZld(self: *MachO, comp: *Compilation) !void {
 
         if (lib_not_found) {
             log.warn("Library search paths:", .{});
-            for (lib_dirs.items) |dir| {
+            for (self.lib_dirs.items) |dir| {
                 log.warn("  {s}", .{dir});
             }
         }
 
-        // If we're compiling native and we can find libSystem.B.{dylib, tbd},
-        // we link against that instead of embedded libSystem.B.tbd file.
-        var native_libsystem_available = false;
-        if (self.base.options.is_native_os) blk: {
-            // Try stub file first. If we hit it, then we're done as the stub file
-            // re-exports every single symbol definition.
-            if (try resolveLib(arena, lib_dirs.items, "System", ".tbd")) |full_path| {
-                try libs.append(full_path);
-                native_libsystem_available = true;
-                break :blk;
-            }
-            // If we didn't hit the stub file, try .dylib next. However, libSystem.dylib
-            // doesn't export libc.dylib which we'll need to resolve subsequently also.
-            if (try resolveLib(arena, lib_dirs.items, "System", ".dylib")) |libsystem_path| {
-                if (try resolveLib(arena, lib_dirs.items, "c", ".dylib")) |libc_path| {
-                    try libs.append(libsystem_path);
-                    try libs.append(libc_path);
-                    native_libsystem_available = true;
-                    break :blk;
-                }
-            }
-        }
-        if (!native_libsystem_available) {
-            const full_path = try comp.zig_lib_directory.join(arena, &[_][]const u8{
-                "libc", "darwin", "libSystem.B.tbd",
-            });
-            try libs.append(full_path);
-        }
+        // libSystem
+        const lib_system = try resolveLibSystem(
+            arena,
+            self.lib_dirs.items,
+            self.base.options.is_native_os,
+            comp,
+        );
+        try libs.appendSlice(lib_system);
 
         // frameworks
         var framework_dirs = std.ArrayList([]const u8).init(arena);
@@ -901,10 +942,8 @@ fn linkWithZld(self: *MachO, comp: *Compilation) !void {
             try argv.append("-o");
             try argv.append(full_out_path);
 
-            if (native_libsystem_available) {
-                try argv.append("-lSystem");
-                try argv.append("-lc");
-            }
+            try argv.append("-lSystem");
+            try argv.append("-lc");
 
             for (search_lib_names.items) |l_name| {
                 try argv.append(try std.fmt.allocPrint(arena, "-l{s}", .{l_name}));
@@ -961,8 +1000,15 @@ fn linkWithZld(self: *MachO, comp: *Compilation) !void {
         }
 
         try self.sortSections();
-        try self.addRpathLCs(rpaths.items);
-        try self.addLoadDylibLCs();
+
+        for (rpaths) |rpath| {
+            try self.addRpathLC(rpath);
+        }
+
+        for (self.referenced_dylibs.keys()) |id| {
+            try self.addLoadDylibLC(id);
+        }
+
         try self.addDataInCodeLC();
         try self.addCodeSignatureLC();
         try self.allocateTextSegment();
@@ -2328,7 +2374,7 @@ fn resolveSymbols(self: *MachO) !void {
         if (symbolIsNull(sym)) continue;
 
         const sym_name = self.getString(sym.n_strx);
-        for (self.dylibs.items) |*dylib, id| {
+        for (self.dylibs.items) |dylib, id| {
             if (!dylib.symbols.contains(sym_name)) continue;
 
             const dylib_id = @intCast(u16, id);
@@ -2663,7 +2709,7 @@ fn populateMetadata(self: *MachO) !void {
         self.dylinker_cmd_index = @intCast(u16, self.load_commands.items.len);
         const cmdsize = @intCast(u32, mem.alignForwardGeneric(
             u64,
-            @sizeOf(macho.dylinker_command) + mem.lenZ(DEFAULT_DYLD_PATH),
+            @sizeOf(macho.dylinker_command) + mem.lenZ(DYLD_PATH),
             @sizeOf(u64),
         ));
         var dylinker_cmd = commands.emptyGenericCommandWithData(macho.dylinker_command{
@@ -2673,7 +2719,7 @@ fn populateMetadata(self: *MachO) !void {
         });
         dylinker_cmd.data = try self.base.allocator.alloc(u8, cmdsize - dylinker_cmd.inner.name);
         mem.set(u8, dylinker_cmd.data, 0);
-        mem.copy(u8, dylinker_cmd.data, mem.spanZ(DEFAULT_DYLD_PATH));
+        mem.copy(u8, dylinker_cmd.data, mem.spanZ(DYLD_PATH));
         try self.load_commands.append(self.base.allocator, .{ .Dylinker = dylinker_cmd });
     }
 
@@ -2779,39 +2825,37 @@ fn addCodeSignatureLC(self: *MachO) !void {
     }
 }
 
-fn addRpathLCs(self: *MachO, rpaths: []const []const u8) !void {
-    for (rpaths) |rpath| {
-        const cmdsize = @intCast(u32, mem.alignForwardGeneric(
-            u64,
-            @sizeOf(macho.rpath_command) + rpath.len + 1,
-            @sizeOf(u64),
-        ));
-        var rpath_cmd = commands.emptyGenericCommandWithData(macho.rpath_command{
-            .cmd = macho.LC_RPATH,
-            .cmdsize = cmdsize,
-            .path = @sizeOf(macho.rpath_command),
-        });
-        rpath_cmd.data = try self.base.allocator.alloc(u8, cmdsize - rpath_cmd.inner.path);
-        mem.set(u8, rpath_cmd.data, 0);
-        mem.copy(u8, rpath_cmd.data, rpath);
-        try self.load_commands.append(self.base.allocator, .{ .Rpath = rpath_cmd });
-    }
+fn addRpathLC(self: *MachO, rpath: []const u8) !void {
+    const cmdsize = @intCast(u32, mem.alignForwardGeneric(
+        u64,
+        @sizeOf(macho.rpath_command) + rpath.len + 1,
+        @sizeOf(u64),
+    ));
+    var rpath_cmd = commands.emptyGenericCommandWithData(macho.rpath_command{
+        .cmd = macho.LC_RPATH,
+        .cmdsize = cmdsize,
+        .path = @sizeOf(macho.rpath_command),
+    });
+    rpath_cmd.data = try self.base.allocator.alloc(u8, cmdsize - rpath_cmd.inner.path);
+    mem.set(u8, rpath_cmd.data, 0);
+    mem.copy(u8, rpath_cmd.data, rpath);
+    try self.load_commands.append(self.base.allocator, .{ .Rpath = rpath_cmd });
+    self.load_commands_dirty = true;
 }
 
-fn addLoadDylibLCs(self: *MachO) !void {
-    for (self.referenced_dylibs.keys()) |id| {
-        const dylib = self.dylibs.items[id];
-        const dylib_id = dylib.id orelse unreachable;
-        var dylib_cmd = try commands.createLoadDylibCommand(
-            self.base.allocator,
-            dylib_id.name,
-            dylib_id.timestamp,
-            dylib_id.current_version,
-            dylib_id.compatibility_version,
-        );
-        errdefer dylib_cmd.deinit(self.base.allocator);
-        try self.load_commands.append(self.base.allocator, .{ .Dylib = dylib_cmd });
-    }
+fn addLoadDylibLC(self: *MachO, id: u16) !void {
+    const dylib = self.dylibs.items[id];
+    const dylib_id = dylib.id orelse unreachable;
+    var dylib_cmd = try commands.createLoadDylibCommand(
+        self.base.allocator,
+        dylib_id.name,
+        dylib_id.timestamp,
+        dylib_id.current_version,
+        dylib_id.compatibility_version,
+    );
+    errdefer dylib_cmd.deinit(self.base.allocator);
+    try self.load_commands.append(self.base.allocator, .{ .Dylib = dylib_cmd });
+    self.load_commands_dirty = true;
 }
 
 fn flushZld(self: *MachO) !void {
@@ -3344,6 +3388,11 @@ pub fn deinit(self: *MachO) void {
     }
     self.dylibs.deinit(self.base.allocator);
     self.referenced_dylibs.deinit(self.base.allocator);
+
+    for (self.lib_dirs.items) |dir| {
+        self.base.allocator.free(dir);
+    }
+    self.lib_dirs.deinit(self.base.allocator);
 
     for (self.load_commands.items) |*lc| {
         lc.deinit(self.base.allocator);
@@ -4294,7 +4343,7 @@ pub fn populateMissingMetadata(self: *MachO) !void {
         self.dylinker_cmd_index = @intCast(u16, self.load_commands.items.len);
         const cmdsize = @intCast(u32, mem.alignForwardGeneric(
             u64,
-            @sizeOf(macho.dylinker_command) + mem.lenZ(DEFAULT_DYLD_PATH),
+            @sizeOf(macho.dylinker_command) + mem.lenZ(DYLD_PATH),
             @sizeOf(u64),
         ));
         var dylinker_cmd = commands.emptyGenericCommandWithData(macho.dylinker_command{
@@ -4304,18 +4353,8 @@ pub fn populateMissingMetadata(self: *MachO) !void {
         });
         dylinker_cmd.data = try self.base.allocator.alloc(u8, cmdsize - dylinker_cmd.inner.name);
         mem.set(u8, dylinker_cmd.data, 0);
-        mem.copy(u8, dylinker_cmd.data, mem.spanZ(DEFAULT_DYLD_PATH));
+        mem.copy(u8, dylinker_cmd.data, mem.spanZ(DYLD_PATH));
         try self.load_commands.append(self.base.allocator, .{ .Dylinker = dylinker_cmd });
-        self.load_commands_dirty = true;
-    }
-    if (self.libsystem_cmd_index == null) {
-        self.libsystem_cmd_index = @intCast(u16, self.load_commands.items.len);
-
-        var dylib_cmd = try commands.createLoadDylibCommand(self.base.allocator, mem.spanZ(LIB_SYSTEM_PATH), 2, 0, 0);
-        errdefer dylib_cmd.deinit(self.base.allocator);
-
-        try self.load_commands.append(self.base.allocator, .{ .Dylib = dylib_cmd });
-
         self.load_commands_dirty = true;
     }
     if (self.main_cmd_index == null) {
@@ -4384,32 +4423,6 @@ pub fn populateMissingMetadata(self: *MachO) !void {
             },
         });
         self.load_commands_dirty = true;
-    }
-    if (!self.strtab_dir.containsAdapted(@as([]const u8, "dyld_stub_binder"), StringSliceAdapter{
-        .strtab = &self.strtab,
-    })) {
-        const import_sym_index = @intCast(u32, self.imports.items.len);
-        const n_strx = try self.makeString("dyld_stub_binder");
-        try self.imports.append(self.base.allocator, .{
-            .n_strx = n_strx,
-            .n_type = macho.N_UNDF | macho.N_EXT,
-            .n_sect = 0,
-            .n_desc = @intCast(u8, 1) * macho.N_SYMBOL_RESOLVER,
-            .n_value = 0,
-        });
-        try self.symbol_resolver.putNoClobber(self.base.allocator, n_strx, .{
-            .where = .import,
-            .where_index = import_sym_index,
-        });
-        const got_key = GotIndirectionKey{
-            .where = .import,
-            .where_index = import_sym_index,
-        };
-        const got_index = @intCast(u32, self.got_entries.items.len);
-        try self.got_entries.append(self.base.allocator, got_key);
-        try self.got_entries_map.putNoClobber(self.base.allocator, got_key, got_index);
-        try self.writeGotEntry(got_index);
-        self.binding_info_dirty = true;
     }
     if (self.stub_helper_stubs_start_off == null) {
         try self.writeStubHelperPreamble();
@@ -4533,14 +4546,34 @@ pub fn addExternFn(self: *MachO, name: []const u8) !u32 {
         return resolv.where_index;
     }
 
-    log.debug("adding new extern function '{s}' with dylib ordinal 1", .{sym_name});
+    // TODO this might be a good spot to work out which dylib to expect this symbol in.
+    // Perhaps we could store some kind of quick lookup by name map for dylibs?
+    const ordinal: u16 = blk: for (self.dylibs.items) |dylib, id| {
+        if (!dylib.symbols.contains(sym_name)) continue;
+
+        const dylib_id = @intCast(u16, id);
+        if (!self.referenced_dylibs.contains(dylib_id)) {
+            // TODO handle removal of dylibs in incremental context.
+            try self.referenced_dylibs.putNoClobber(self.base.allocator, dylib_id, {});
+            try self.addLoadDylibLC(dylib_id);
+        }
+
+        const ordinal = self.referenced_dylibs.getIndex(dylib_id) orelse unreachable;
+        break :blk @intCast(u16, ordinal + 1);
+    } else {
+        log.warn("symbol '{s}' not resolved in any dynamic library", .{sym_name});
+        break :blk 0;
+    };
+
+    log.debug("adding new extern function '{s}' with dylib ordinal {d}", .{ sym_name, ordinal });
+
     const import_sym_index = @intCast(u32, self.imports.items.len);
     const n_strx = try self.makeString(sym_name);
     try self.imports.append(self.base.allocator, .{
         .n_strx = n_strx,
         .n_type = macho.N_UNDF | macho.N_EXT,
         .n_sect = 0,
-        .n_desc = @intCast(u8, 1) * macho.N_SYMBOL_RESOLVER,
+        .n_desc = ordinal * macho.N_SYMBOL_RESOLVER,
         .n_value = 0,
     });
     try self.symbol_resolver.putNoClobber(self.base.allocator, n_strx, .{

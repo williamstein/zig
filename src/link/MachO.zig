@@ -339,34 +339,38 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
 
     self.base.file = file;
 
-    if (options.output_mode == .Lib and options.link_mode == .Static) {
-        return self;
+    switch (options.output_mode) {
+        .Obj => return error.TODOImplementWritingObjFiles,
+        .Lib => if (options.link_mode == .Static) return self,
+        .Exe => {},
     }
 
-    if (!options.strip and options.module != null) {
-        // Create dSYM bundle.
-        const dir = options.module.?.zig_cache_artifact_directory;
-        log.debug("creating {s}.dSYM bundle in {s}", .{ sub_path, dir.path });
+    if (options.module) |module| {
+        if (!options.strip) {
+            // Create dSYM bundle.
+            const dir = module.zig_cache_artifact_directory;
+            log.debug("creating {s}.dSYM bundle in {s}", .{ sub_path, dir.path });
 
-        const d_sym_path = try fmt.allocPrint(
-            allocator,
-            "{s}.dSYM" ++ fs.path.sep_str ++ "Contents" ++ fs.path.sep_str ++ "Resources" ++ fs.path.sep_str ++ "DWARF",
-            .{sub_path},
-        );
-        defer allocator.free(d_sym_path);
+            const d_sym_path = try fmt.allocPrint(
+                allocator,
+                "{s}.dSYM" ++ fs.path.sep_str ++ "Contents" ++ fs.path.sep_str ++ "Resources" ++ fs.path.sep_str ++ "DWARF",
+                .{sub_path},
+            );
+            defer allocator.free(d_sym_path);
 
-        var d_sym_bundle = try dir.handle.makeOpenPath(d_sym_path, .{});
-        defer d_sym_bundle.close();
+            var d_sym_bundle = try dir.handle.makeOpenPath(d_sym_path, .{});
+            defer d_sym_bundle.close();
 
-        const d_sym_file = try d_sym_bundle.createFile(sub_path, .{
-            .truncate = false,
-            .read = true,
-        });
+            const d_sym_file = try d_sym_bundle.createFile(sub_path, .{
+                .truncate = false,
+                .read = true,
+            });
 
-        self.d_sym = .{
-            .base = self,
-            .file = d_sym_file,
-        };
+            self.d_sym = .{
+                .base = self,
+                .file = d_sym_file,
+            };
+        }
     }
 
     // Index 0 is always a null symbol.
@@ -419,10 +423,6 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
     if (use_stage1) {
         return self.linkWithZld(comp);
     } else {
-        switch (self.base.options.effectiveOutputMode()) {
-            .Exe, .Obj => {},
-            .Lib => return error.TODOImplementWritingLibFiles,
-        }
         return self.flushModule(comp);
     }
 }
@@ -4019,12 +4019,6 @@ pub fn getDeclVAddr(self: *MachO, decl: *const Module.Decl) u64 {
 }
 
 pub fn populateMissingMetadata(self: *MachO) !void {
-    switch (self.base.options.output_mode) {
-        .Exe => {},
-        .Obj => return error.TODOImplementWritingObjFiles,
-        .Lib => return error.TODOImplementWritingLibFiles,
-    }
-
     if (self.pagezero_segment_cmd_index == null) {
         self.pagezero_segment_cmd_index = @intCast(u16, self.load_commands.items.len);
         try self.load_commands.append(self.base.allocator, .{
